@@ -1,8 +1,8 @@
 package com.atguigu.gmall0317.realtime.dws
 
-import java.text.SimpleDateFormat
 
 import com.alibaba.fastjson.JSON
+import com.alibaba.fastjson.serializer.SerializeConfig
 import com.atguigu.gmall0317.realtime.bean.{OrderDetail, OrderInfo, OrderWide}
 import com.atguigu.gmall0317.realtime.util.{MyKafkaUtil, OffsetManager, RedisUtil}
 import org.apache.kafka.clients.consumer.ConsumerRecord
@@ -90,11 +90,56 @@ object DwsOrderWideWithCacheApp {
     val orderDetailWithKeyDstream =
       orderDetailDstream.map(orderDetail => (orderDetail.order_id, orderDetail))
 
-    val fullJoine
-      dDstream =
+    val fullJoinedDstream =
       orderInfoWithKeyDstream.fullOuterJoin(orderDetailWithKeyDstream)
 
-    val orderWideDstream = orderTupleDstream.map {
+    val orderWideDstream = fullJoinedDstream.flatMap { case (orderId, (orderInfoOpt, orderDetailOpt)) =>
+      val orderWidesList = new ListBuffer[OrderWide]
+      val jedis = RedisUtil.getJedisClient
+      if (orderInfoOpt != None) {
+        val orderInfo = orderInfoOpt.get
+        if (orderDetailOpt != None) {
+          val orderDetail = orderDetailOpt.get
+          orderWidesList.append(new OrderWide(orderInfo, orderDetail))
+        }
+        val orderInfoKey = "orderjoin:orderInfo:" + orderInfo.id
+        val orderInfoJson = JSON.toJSONString(orderInfo, new SerializeConfig(true))
+        jedis.setex(orderInfoKey, 600, orderInfoJson)
+
+        val orderDetailKey = "orderjoin:orderDetail:" + orderInfo.id
+        val orderDetailJsonSet = jedis.smembers(orderDetailKey)
+        if (orderDetailJsonSet != null && orderDetailJsonSet.size() > 0) {
+          import collection.JavaConverters._
+          for (orderDetailJson <- orderDetailJsonSet.asScala) {
+            val orderDetail: OrderDetail = JSON.parseObject(orderDetailJson, classOf[OrderDetail])
+           orderWidesList += new OrderWide(orderInfo, orderDetail)
+
+
+          }
+        }
+
+      }else{
+        val orderDetail = orderDetailOpt.get
+        val orderDetailKey = "orderjoin:orderDetail:" + orderDetail.order_id
+        val orderDetailJson = JSON.toJSONString(orderDetail, new SerializeConfig(true))
+        jedis.sadd(orderDetailKey,orderDetailJson)
+        jedis.expire(orderDetailKey,600)
+
+        val orderInfoKey = "orderjoin:orderInfo:"+orderDetail.order_id
+        val orderInfoJson = jedis.get(orderInfoKey)
+        if (orderInfoJson!= null && orderInfoJson.size >0) {
+          val orderInfo: OrderInfo = JSON.parseObject(orderInfoJson, classOf[OrderInfo])
+          orderWidesList += new OrderWide(orderInfo,orderDetail)
+        }
+      }
+      jedis.close()
+      orderWidesList
+    }
+
+    orderWideDstream.print(100)
+    ssc.start()
+    ssc.awaitTermination()
+   /* val orderWideDstream = orderTupleDstream.map {
       case (orderId,(orderInfo: OrderInfo, orderDetail: OrderDetail)) =>
         new OrderWide(orderInfo, orderDetail)
     }
@@ -122,7 +167,6 @@ object DwsOrderWideWithCacheApp {
 
     filterOrderWideDstream.print(1000)
     ssc.start()
-    ssc.awaitTermination()
-
+    ssc.awaitTermination()*/
   }
 }
